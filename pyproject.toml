@@ -1,0 +1,76 @@
+[project]
+name = "yt-transcribe"
+version = "1.0.0"
+description = "YouTube channel transcription with faster-whisper and LLM cleaning"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "yt-dlp>=2024.0.0",
+    "click>=8.0.0",
+    "rich>=13.0.0",
+    "openai>=1.0.0",
+    "faster-whisper>=1.0.0",
+]
+
+[project.optional-dependencies]
+dev = []
+
+[project.scripts]
+yt-transcribe = "yt_transcribe.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.metadata]
+allow-direct-references = true
+
+
+
+[tool.hatch.build.targets.sdist]
+include = ["yt_transcribe"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["yt_transcribe"]
+
+[tool.pyright]
+include = ["yt_transcribe"]
+exclude = ["**/__pycache__"]
+defineConstant = { DEBUG = true }
+stubPath = ""
+venvPath = "."
+venv = ".venv"
+reportMissingImports = "error"
+reportMissingTypeStubs = "warning"
+reportUndefinedVariable = "error"
+reportUnknownMemberType = "warning"
+reportUnknownVariableType = "warning"
+reportUnknownArgumentType = "warning"
+reportUnknownParameterType = "warning"
+reportInvalidTypeForm = "error"
+reportAny = "warning"
+reportMissingTypeArgument = "warning"
+strictListInference = true
+strictDictionaryInference = true
+strictSetInference = true
+strictParameterNoneValue = true
+
+[dependency-groups]
+dev = [
+    "pyrefly",
+    "ruff",
+]
+
+[tool.ruff]
+line-length = 88
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+ignore = ["E501"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["yt_transcribe"]
+
+[tool.pyrefly]
+project_includes = ["yt_transcribe"]
