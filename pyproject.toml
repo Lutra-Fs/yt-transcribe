@@ -1,7 +1,7 @@
 [project]
 name = "yt-transcribe"
-version = "1.0.0"
-description = "YouTube channel transcription with faster-whisper and LLM cleaning"
+version = "1.1.0"
+description = "YouTube channel transcription with MLX Qwen3-ASR and faster-whisper backends"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
@@ -9,11 +9,13 @@ dependencies = [
     "click>=8.0.0",
     "rich>=13.0.0",
     "openai>=2.16.0",
+    "mlx-audio>=0.3.0",
     "faster-whisper>=1.2.0",
 ]
 
 [project.optional-dependencies]
 dev = []
+mlx = ["mlx>=0.20.0"]
 
 [project.scripts]
 yt-transcribe = "yt_transcribe.cli:main"

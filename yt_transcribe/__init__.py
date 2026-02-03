@@ -1,3 +1,3 @@
-"""YouTube channel transcription with local GLM-ASR and LLM cleaning."""
+"""YouTube channel transcription with MLX Qwen3-ASR and faster-whisper backends."""
 
-__version__ = "0.1.0"
+__version__ = "1.1.0"

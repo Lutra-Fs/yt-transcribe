@@ -1,7 +1,9 @@
 """CLI interface for yt-transcribe."""
 
 import os
+import subprocess
 import tempfile
+from collections.abc import Iterator
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 
@@ -9,11 +11,66 @@ import click
 from rich.console import Console
 from rich.progress import Progress, SpinnerColumn, TextColumn
 
-from .asr import ASRTranscriber, get_backend
+from .asr import ASRTranscriber, TranscriptionResult, get_backend
 from .cleaner import TranscriptCleaner
 from .downloader import VideoInfo, download_channel
+from .subtitle import export_srt, export_vtt
 
 console = Console()
+
+
+def convert_to_wav(audio_path: Path) -> Path:
+    """Convert audio file to WAV format using FFmpeg.
+
+    Args:
+        audio_path: Path to input audio file
+
+    Returns:
+        Path to output WAV file
+    """
+    wav_path = audio_path.with_suffix(".wav")
+
+    try:
+        subprocess.run(
+            [
+                "ffmpeg",
+                "-i", str(audio_path),
+                "-acodec", "pcm_s16le",
+                "-ar", "16000",
+                "-ac", "1",
+                "-y",  # Overwrite output file
+                str(wav_path),
+            ],
+            check=True,
+            capture_output=True,
+        )
+        return wav_path
+    except subprocess.CalledProcessError as e:
+        raise RuntimeError(f"FFmpeg conversion failed: {e.stderr.decode()}") from e
+    except FileNotFoundError:
+        raise RuntimeError("FFmpeg not found. Please install FFmpeg.")
+
+
+def stream_transcription(transcriber: ASRTranscriber, audio_path: Path) -> Iterator[str]:
+    """Stream transcription output in real-time (MLX only).
+
+    Args:
+        transcriber: Loaded ASRTranscriber instance
+        audio_path: Path to audio file
+
+    Yields:
+        Chunks of transcribed text as they become available
+    """
+    # For MLX backend with streaming support
+    result = transcriber.transcribe(audio_path)
+
+    # If the result has segments, yield them progressively
+    if result.segments:
+        for segment in result.segments:
+            yield segment.get("text", "")
+    else:
+        # Fallback to yielding full text
+        yield result.text
 
 
 def transcribe_single_video(
@@ -21,9 +78,10 @@ def transcribe_single_video(
     api_endpoint: str,
     api_key: str,
     model: str,
-    asr_model: str | None,
     backend: str,
-    cpu_threads: int,
+    asr_model: str | None,
+    language: str | None,
+    with_timestamps: bool,
 ) -> dict:
     """Transcribe a single video (audio already downloaded).
 
@@ -32,35 +90,52 @@ def transcribe_single_video(
         api_endpoint: LLM API endpoint for transcript cleaning
         api_key: LLM API key
         model: LLM model name for cleaning
-        asr_model: ASR model name
         backend: ASR backend
-        cpu_threads: Number of CPU threads for ASR
+        asr_model: ASR model name
+        language: Language code
+        with_timestamps: Whether to enable word-level timestamps
 
     Returns:
         Dict with transcription result or error
     """
     try:
-        # Set CPU threads
-        if cpu_threads > 0:
-            os.environ["OMP_NUM_THREADS"] = str(cpu_threads)
-            os.environ["MKL_NUM_THREADS"] = str(cpu_threads)
+        # Convert to WAV for MLX backend
+        audio_path = video_info.audio_path
+        wav_path: Path | None = None
 
-        transcriber = ASRTranscriber(model_name=asr_model, backend=backend)
+        if backend == "mlx":
+            wav_path = convert_to_wav(audio_path)
+            audio_path = wav_path
+
+        transcriber = ASRTranscriber(
+            backend=backend,
+            model_name=asr_model,
+            language=language,
+        )
         transcriber.load()
+
+        # Use aligner backend for timestamps if requested
+        if with_timestamps and backend == "mlx":
+            from .asr import MLXAlignerBackend
+            aligner = MLXAlignerBackend()
+            aligner.load()
+            result = aligner.transcribe(audio_path, language=language)
+        else:
+            result = transcriber.transcribe(audio_path)
 
         cleaner = TranscriptCleaner(
             api_endpoint=api_endpoint,
             api_key=api_key,
             model=model,
         )
-
-        raw_transcript = transcriber.transcribe(video_info.audio_path)
-        cleaned_transcript = cleaner.clean(raw_transcript)
+        cleaned_transcript = cleaner.clean(result.text)
 
         return {
             "title": video_info.title,
             "id": video_info.id,
             "transcript": cleaned_transcript,
+            "words": result.words if with_timestamps else None,
+            "language": result.language,
         }
     except Exception as e:
         return {
@@ -68,6 +143,10 @@ def transcribe_single_video(
             "id": video_info.id,
             "error": str(e),
         }
+    finally:
+        # Clean up temporary WAV file
+        if wav_path and wav_path.exists():
+            wav_path.unlink()
 
 
 def process_videos_sequential(
@@ -76,6 +155,10 @@ def process_videos_sequential(
     cleaner,
     keep_audio: bool,
     console,
+    language: str | None = None,
+    with_timestamps: bool = False,
+    subtitle_format: str = "none",
+    stream: bool = False,
 ) -> list:
     """Process videos sequentially (single process).
 
@@ -85,6 +168,10 @@ def process_videos_sequential(
         cleaner: TranscriptCleaner instance
         keep_audio: Whether to keep audio files
         console: Rich console for output
+        language: Language code
+        with_timestamps: Whether to generate word-level timestamps
+        subtitle_format: Subtitle export format (none, srt, vtt, both)
+        stream: Whether to enable streaming output
 
     Returns:
         List of transcription results
@@ -103,21 +190,66 @@ def process_videos_sequential(
             )
 
             try:
-                progress.update(task, description=f"[{i}/{len(videos)}] Transcribing: {video_info.title[:40]}...")
-                raw_transcript = transcriber.transcribe(video_info.audio_path)
+                # Convert to WAV for MLX backend
+                audio_path = video_info.audio_path
+                wav_path: Path | None = None
+
+                if transcriber.backend_name == "mlx":
+                    progress.update(task, description=f"[{i}/{len(videos)}] Converting: {video_info.title[:40]}...")
+                    wav_path = convert_to_wav(audio_path)
+                    audio_path = wav_path
+
+                if with_timestamps and transcriber.backend_name == "mlx":
+                    progress.update(task, description=f"[{i}/{len(videos)}] Transcribing with timestamps: {video_info.title[:40]}...")
+                    from .asr import MLXAlignerBackend
+                    aligner = MLXAlignerBackend()
+                    aligner.load()
+                    result = aligner.transcribe(audio_path, language=language)
+                else:
+                    if stream:
+                        progress.update(task, description=f"[{i}/{len(videos)}] Streaming transcription: {video_info.title[:40]}...")
+                        console.print(f"[dim]Transcribing: {video_info.title}[/]")
+                        text_chunks = []
+                        for chunk in stream_transcription(transcriber, audio_path):
+                            text_chunks.append(chunk)
+                            console.print(chunk, end="")
+                        console.print()
+                        result = TranscriptionResult(text="".join(text_chunks))
+                    else:
+                        progress.update(task, description=f"[{i}/{len(videos)}] Transcribing: {video_info.title[:40]}...")
+                        result = transcriber.transcribe(audio_path)
 
                 progress.update(task, description=f"[{i}/{len(videos)}] Cleaning: {video_info.title[:40]}...")
-                cleaned_transcript = cleaner.clean(raw_transcript)
+                cleaned_transcript = cleaner.clean(result.text)
 
-                results.append({
+                video_result = {
                     "index": i,
                     "title": video_info.title,
                     "transcript": cleaned_transcript,
                     "id": video_info.id,
-                })
+                    "words": result.words if with_timestamps else None,
+                    "language": result.language,
+                }
 
+                # Export subtitles if requested
+                if with_timestamps and subtitle_format != "none" and result.words:
+                    base_name = video_info.id
+                    if subtitle_format in ("srt", "both"):
+                        srt_path = Path.cwd() / f"{base_name}.srt"
+                        export_srt(result.words, srt_path)
+                        console.print(f"[dim]Exported: {srt_path}[/]")
+                    if subtitle_format in ("vtt", "both"):
+                        vtt_path = Path.cwd() / f"{base_name}.vtt"
+                        export_vtt(result.words, vtt_path)
+                        console.print(f"[dim]Exported: {vtt_path}[/]")
+
+                results.append(video_result)
+
+                # Clean up
                 if not keep_audio and video_info.audio_path.exists():
                     video_info.audio_path.unlink()
+                if wav_path and wav_path.exists():
+                    wav_path.unlink()
 
             except Exception as e:
                 console.print(f"[red]Error processing {video_info.title}: {e}[/]")
@@ -133,9 +265,10 @@ def process_videos_parallel(
     api_endpoint: str,
     api_key: str,
     model: str,
-    asr_model: str | None,
     backend: str,
-    cpu_threads: int,
+    asr_model: str | None,
+    language: str | None,
+    with_timestamps: bool,
     max_workers: int,
     keep_audio: bool,
     console,
@@ -147,9 +280,10 @@ def process_videos_parallel(
         api_endpoint: LLM API endpoint for transcript cleaning
         api_key: LLM API key
         model: LLM model name for cleaning
-        asr_model: ASR model name
         backend: ASR backend
-        cpu_threads: Number of CPU threads for ASR
+        asr_model: ASR model name
+        language: Language code
+        with_timestamps: Whether to enable word-level timestamps
         max_workers: Maximum number of parallel workers
         keep_audio: Whether to keep audio files
         console: Rich console for output
@@ -171,7 +305,6 @@ def process_videos_parallel(
         )
 
         with ProcessPoolExecutor(max_workers=max_workers) as executor:
-            # Submit all tasks
             futures = {}
             for video_info in videos:
                 future = executor.submit(
@@ -180,20 +313,19 @@ def process_videos_parallel(
                     api_endpoint,
                     api_key,
                     model,
-                    asr_model,
                     backend,
-                    cpu_threads,
+                    asr_model,
+                    language,
+                    with_timestamps,
                 )
                 futures[future] = video_info
 
-            # Collect results as they complete
             for future in as_completed(futures):
                 video_info = futures[future]
                 try:
-                    result = future.result(timeout=600)  # 10 min timeout per video
+                    result = future.result(timeout=600)
                     if result and "error" not in result:
                         results.append(result)
-                        # Clean up audio if not keeping
                         if not keep_audio and video_info.audio_path.exists():
                             video_info.audio_path.unlink()
                     else:
@@ -204,7 +336,6 @@ def process_videos_parallel(
                 completed += 1
                 progress.update(overall_task, completed=completed)
 
-    # Sort by title for consistent ordering
     results.sort(key=lambda x: x.get("title", ""))
     return results
 
@@ -236,15 +367,38 @@ def process_videos_parallel(
     help="Maximum number of videos to process",
 )
 @click.option(
-    "--asr-model",
-    default=None,
-    help="ASR model name (auto-selected based on backend)",
+    "--backend",
+    type=click.Choice(["auto", "mlx", "faster-whisper"]),
+    default="auto",
+    help="ASR backend (default: auto-detects MLX on Apple Silicon)",
 )
 @click.option(
-    "--backend",
-    type=click.Choice(["auto", "faster-whisper", "mlx", "mlx-plus", "cuda", "rocm", "mps", "cpu"]),
+    "--language",
+    "-l",
+    type=str,
     default="auto",
-    help="ASR backend (default: auto-detect, prefers faster-whisper)",
+    help="Language for transcription (auto, chinese, english, japanese, korean, french, german, spanish, russian, portuguese, italian, dutch)",
+)
+@click.option(
+    "--asr-model",
+    default=None,
+    help="ASR model size: for MLX: 0.6b, 1.7b; for faster-whisper: tiny, base, small, medium, large-v3",
+)
+@click.option(
+    "--with-timestamps",
+    is_flag=True,
+    help="Enable word-level timestamps (MLX only, useful for subtitle generation)",
+)
+@click.option(
+    "--subtitle-format",
+    type=click.Choice(["none", "srt", "vtt", "both"]),
+    default="none",
+    help="Subtitle export format (requires --with-timestamps)",
+)
+@click.option(
+    "--stream/--no-stream",
+    default=True,
+    help="Enable streaming transcription output (default: enabled for MLX)",
 )
 @click.option(
     "--workers",
@@ -301,8 +455,12 @@ def main(
     api_key: str,
     model: str,
     max_videos: int | None,
-    asr_model: str | None,
     backend: str,
+    language: str,
+    asr_model: str | None,
+    with_timestamps: bool,
+    subtitle_format: str,
+    stream: bool,
     workers: int,
     cpu_threads: int,
     output: str | None,
@@ -317,18 +475,31 @@ def main(
     CHANNEL_URL: YouTube channel URL (e.g., https://www.youtube.com/@channelname)
 
     This tool uses yt-dlp to download all audio from a channel, then transcribes
-    it using local ASR and cleans the transcript using an LLM.
+    it using local ASR (MLX Qwen3-ASR on Apple Silicon, faster-whisper fallback) and
+    cleans the transcript using an LLM.
 
     Examples:
-        # Basic usage
-        yt-transcribe "https://www.youtube.com/@channel" --api-key "xxx"
+        # Basic usage (auto-detects MLX on Apple Silicon)
+        yt-transcribe "https://www.youtube.com/@channel" --api-key "key"
 
-        # Download 50 videos with rate limiting and archive support
-        yt-transcribe "https://www.youtube.com/@channel" --api-key "xxx" \\
-            --max-videos 50 --rate-limit 5M --download-archive archive.txt
+        # With streaming output
+        yt-transcribe "https://www.youtube.com/@channel" --api-key "key" --stream
 
-        # Parallel processing with 2 workers
-        yt-transcribe "https://www.youtube.com/@channel" --api-key "xxx" -j 2
+        # With timestamps and SRT export
+        yt-transcribe "https://www.youtube.com/@channel" --api-key "key" \\
+            --with-timestamps --subtitle-format srt
+
+        # Explicit language selection
+        yt-transcribe "https://www.youtube.com/@channel" --api-key "key" \\
+            --language english
+
+        # Use larger model
+        yt-transcribe "https://www.youtube.com/@channel" --api-key "key" \\
+            --asr-model 1.7b
+
+        # Force faster-whisper on Apple Silicon
+        yt-transcribe "https://www.youtube.com/@channel" --api-key "key" \\
+            --backend faster-whisper
     """
     if audio_dir:
         keep_audio = True
@@ -345,7 +516,6 @@ def main(
     )
 
     def download_progress(video_id: str, status: str, title: str) -> None:
-        """Progress callback for downloads."""
         console.print(f"[dim]Downloaded: {title[:50]}...[/]")
 
     video_infos = download_channel(
@@ -364,8 +534,9 @@ def main(
 
     console.print(f"[green]Downloaded {len(video_infos)} videos[/]")
 
-    # Phase 2: Transcribe in parallel
+    # Phase 2: Transcribe
     detected_backend = backend if backend != "auto" else get_backend()
+    console.print(f"[dim]Using backend: {detected_backend}[/]")
 
     # Set CPU threads for ASR
     if cpu_threads > 0:
@@ -374,15 +545,22 @@ def main(
         console.print(f"[dim]Using {cpu_threads} CPU threads for ASR[/]")
 
     if workers > 1:
+        # Parallel processing doesn't support streaming or subtitles
+        if stream:
+            console.print("[yellow]Streaming disabled in parallel mode[/]")
+        if subtitle_format != "none":
+            console.print("[yellow]Subtitle export disabled in parallel mode[/]")
+
         console.print(f"[bold blue]Using {workers} parallel workers for transcription[/]")
         results = process_videos_parallel(
             videos=video_infos,
             api_endpoint=api_endpoint,
             api_key=api_key,
             model=model,
-            asr_model=asr_model,
             backend=detected_backend,
-            cpu_threads=cpu_threads,
+            asr_model=asr_model,
+            language=language if language != "auto" else None,
+            with_timestamps=with_timestamps,
             max_workers=workers,
             keep_audio=keep_audio,
             console=console,
@@ -390,8 +568,9 @@ def main(
     else:
         console.print(f"[bold blue]Loading ASR model (backend: {detected_backend})...[/]")
         transcriber = ASRTranscriber(
-            model_name=asr_model,
             backend=detected_backend,
+            model_name=asr_model,
+            language=language if language != "auto" else None,
         )
         transcriber.load()
         console.print(f"[green]ASR ready: {transcriber.backend_info}[/]")
@@ -408,6 +587,10 @@ def main(
             cleaner=cleaner,
             keep_audio=keep_audio,
             console=console,
+            language=language if language != "auto" else None,
+            with_timestamps=with_timestamps,
+            subtitle_format=subtitle_format,
+            stream=stream and detected_backend == "mlx",
         )
 
     output_text = format_output(results)
